@@ -35,6 +35,11 @@ from gaze_receiver import GazeReceiver
 
 
 class SyncPlayer:
+    _CACHE_VERSION = 1
+    _CACHE_SAMPLE_WIDTH = 2  # 16-bit PCM pour simpleaudio
+    _CACHE_FRAME_RATE = 44100
+    _CACHE_FADE_MS = 5
+
     def __init__(self):
         self.hw = Hardware()
         self.timeline: Optional[Timeline] = None
@@ -111,7 +116,9 @@ class SyncPlayer:
         mp3_file = mp3_files[0]
 
         cache_file = mp3_file.with_name(f"{mp3_file.stem}.cached.wav")
+        cache_meta = cache_file.with_suffix(cache_file.suffix + ".meta")
         cache_exists = cache_file.exists()
+        cache_meta_exists = cache_meta.exists()
 
         servo_logger.logger.info(f"LOADING_SESSION | Dir: {d.name}")
         servo_logger.logger.info(
@@ -127,18 +134,40 @@ class SyncPlayer:
 
             used_cache = False
             if cache_exists:
+                cache_version: Optional[int] = None
+                if cache_meta_exists:
+                    try:
+                        cache_version = int(cache_meta.read_text().strip())
+                    except Exception as meta_exc:
+                        servo_logger.logger.warning(
+                            f"AUDIO_CACHE_META_ERROR | file={cache_meta.name} | error={meta_exc}"
+                        )
                 try:
-                    self.audio = AudioSegment.from_file(str(cache_file), format="wav")
-                    used_cache = True
-                    servo_logger.logger.info(
-                        f"AUDIO_CACHE_HIT | file={cache_file.name}"
-                    )
+                    cached = AudioSegment.from_file(str(cache_file), format="wav")
+                    if (
+                        cache_version == self._CACHE_VERSION
+                        and cached.sample_width == self._CACHE_SAMPLE_WIDTH
+                        and cached.frame_rate == self._CACHE_FRAME_RATE
+                    ):
+                        self.audio = cached
+                        used_cache = True
+                        servo_logger.logger.info(
+                            f"AUDIO_CACHE_HIT | file={cache_file.name}"
+                        )
+                    else:
+                        servo_logger.logger.info(
+                            f"AUDIO_CACHE_OUTDATED | file={cache_file.name} | "
+                            f"version={cache_version} | sample_width={cached.sample_width} | "
+                            f"frame_rate={cached.frame_rate}"
+                        )
                 except Exception as cache_exc:
                     servo_logger.logger.warning(
                         f"AUDIO_CACHE_HIT_FAILED | file={cache_file.name} | error={cache_exc}"
                     )
                     try:
                         cache_file.unlink()
+                        if cache_meta.exists():
+                            cache_meta.unlink()
                         servo_logger.logger.info(
                             f"AUDIO_CACHE_REMOVED | file={cache_file.name}"
                         )
@@ -148,14 +177,24 @@ class SyncPlayer:
                         )
 
             if not used_cache:
-                self.audio = AudioSegment.from_mp3(mp3_file)
+                loaded = AudioSegment.from_mp3(mp3_file)
+                self.audio = self._prepare_audiosegment(loaded)
                 tmp_cache = cache_file.with_name(cache_file.name + ".tmp")
                 try:
-                    self.audio.export(str(tmp_cache), format="wav")
+                    self.audio.export(
+                        str(tmp_cache),
+                        format="wav",
+                    )
                     tmp_cache.replace(cache_file)
                     servo_logger.logger.info(
                         f"AUDIO_CACHE_CREATED | file={cache_file.name}"
                     )
+                    try:
+                        cache_meta.write_text(str(self._CACHE_VERSION))
+                    except Exception as meta_exc:
+                        servo_logger.logger.warning(
+                            f"AUDIO_CACHE_META_WRITE_FAILED | file={cache_meta.name} | error={meta_exc}"
+                        )
                 except Exception as cache_exc:
                     servo_logger.logger.warning(
                         f"AUDIO_CACHE_WRITE_FAILED | file={cache_file.name} | error={cache_exc}"
@@ -163,6 +202,8 @@ class SyncPlayer:
                     try:
                         if tmp_cache.exists():
                             tmp_cache.unlink()
+                        if cache_meta.exists():
+                            cache_meta.unlink()
                     except Exception:
                         pass
         except Exception as e:
@@ -177,6 +218,18 @@ class SyncPlayer:
         servo_logger.logger.info(
             f"SESSION_LOADED | Duration: {audio_duration:.3f}s | Frames: {len(self.timeline.frames)}"
         )
+
+    def _prepare_audiosegment(self, segment: AudioSegment) -> AudioSegment:
+        """Standardise l'audio pour une lecture simpleaudio fluide."""
+        sanitized = segment.set_sample_width(self._CACHE_SAMPLE_WIDTH)
+        sanitized = sanitized.set_frame_rate(self._CACHE_FRAME_RATE)
+
+        # Applique un léger fondu pour éliminer les clics sur les boucles.
+        fade_ms = self._CACHE_FADE_MS
+        if fade_ms > 0 and len(sanitized) > fade_ms * 2:
+            sanitized = sanitized.fade_in(fade_ms).fade_out(fade_ms)
+
+        return sanitized
 
     # ---------------- Channels control ----------------
     def set_channels(self, flags: Dict[str, bool]) -> None:
